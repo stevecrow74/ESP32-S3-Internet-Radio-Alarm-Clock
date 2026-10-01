@@ -50,6 +50,8 @@ fallback station if first station doesn't load
 touchpad instructions, as above, and Button = save (press physical button to save, if alarm off, pressing button in this 
 page will turn it on, and if alarm is on, pressing button will turn it off while in this page.
 
+When alarm triggers, the volume moves up in steps from 0 to max in 10 second intervals.
+
 https://github.com/stevecrow74/ESP32-S3-Internet-Radio-Alarm-Clock/blob/main/img_3642.jpg
 
 # Reset
