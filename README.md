@@ -1,9 +1,6 @@
 # ESP32-S3-Internet-Radio-Alarm-Clock
 Not just any ordinary radio alarm clock
 
-
-# internet Radio Alarm Clock
-Not just any ordinary alarm clock, this one as a web interface.
 # webui
 The webui displays sections.
 the top section is three buttons that change between pages Clock, Radio, Alarm.
