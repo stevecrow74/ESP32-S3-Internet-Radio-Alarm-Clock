@@ -7,7 +7,8 @@ the top section is three buttons that change between pages Clock, Radio, Alarm.
 below that is what's currently playing on the radio, Station name with metadata 
 showing song title and artist (if available).
 two buttons to select previous/next radio station.
-A volume slider to increase/dcrease volume with text readout below tat.
+A volume slider to increase/dcrease volume with text readout below that.
+
 https://github.com/stevecrow74/ESP32-S3-Internet-Radio-Alarm-Clock/blob/main/img_3637.png
 
 Next section you can select radio station through a dropdown box.
@@ -16,11 +17,13 @@ In the dropdown box you can select the time either by the scroll function (mobil
 in mobile view you can tap on the scrolled numbers to enter alarm time with mobile number pad. then ta the blue tick to 
 enter that time into the box and the save time to accept the changes. With Button to turn alarm on/off.
 below that are two dropdown boxes to change primary and fallback stations.
+
 https://github.com/stevecrow74/ESP32-S3-Internet-Radio-Alarm-Clock/blob/main/img_3638.png
 
 The last section shows device details, WIFI, IP, Time, Alarm time and status.
 at the very bottom is a RESTART DEVICE button, this will reset the device the same as the physical button and volume down combination.
 when pressed you will get a confirmation screen, press ok to restart the device.
+
 https://github.com/stevecrow74/ESP32-S3-Internet-Radio-Alarm-Clock/blob/main/img_3639.png
 
 # Clock
@@ -35,6 +38,7 @@ radio stream metadata, Artist and Song (if available).
 Volume bar, visual indication of volume level.
 Volume numeric indication.
 touch pad instructions ( + station - , + volume - )
+
 https://github.com/stevecrow74/ESP32-S3-Internet-Radio-Alarm-Clock/blob/main/img_3640.jpg
 
 # Alarm
@@ -45,6 +49,7 @@ primary station for alarm to use.
 fallback station if first station doesn't load
 touchpad instructions, as above, and Button = save (press physical button to save, if alarm off, pressing button in this 
 page will turn it on, and if alarm is on, pressing button will turn it off while in this page.
+
 https://github.com/stevecrow74/ESP32-S3-Internet-Radio-Alarm-Clock/blob/main/img_3642.jpg
 
 # Reset
