@@ -1,6 +1,8 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <ArduinoOTA.h>
+#include <esp_system.h>
 #include <WebServer.h>
 #include <Preferences.h>
 #include <time.h>
@@ -26,24 +28,50 @@
 #define TOUCH_THRESHOLD_PERCENT 125
 
 #define BUTTON_PIN 1
+#define BACKLIGHT_PIN 7
 
 #define I2S_BCLK 16
 #define I2S_LRC  15
 #define I2S_DOUT 17
+#define AMP_SHDN_PIN 14
 
 Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
 Audio audio;
 WebServer webServer(80);
 Preferences prefs;
+Preferences wifiPrefs;
 
 // ============================================================
 // CONFIG
 // ============================================================
 
-const char *WIFI_SSID = "Your SSID";
-const char *WIFI_PASSWORD = "Your WIFI PASSWORD";
 const char *NTP_SERVER = "pool.ntp.org";
 const char *TZ_INFO = "GMT0IST,M3.5.0/1,M10.5.0/2";
+const char *WIFI_SETUP_SSID = "Radio-Alarm-Setup";
+const int MAX_WIFI_PROFILES = 9;
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 12000UL;
+const unsigned long WIFI_RETRY_INTERVAL_MS = 30000UL;
+const unsigned long WIFI_AP_RETRY_INTERVAL_MS = 60000UL;
+const unsigned long WIFI_AP_CLOSE_DELAY_MS = 15000UL;
+
+struct WiFiProfile {
+    String ssid;
+    String password;
+};
+
+WiFiProfile wifiProfiles[MAX_WIFI_PROFILES];
+int wifiProfileCount = 0;
+int preferredWiFiProfile = 0;
+int wifiAttemptProfile = 0;
+int wifiProfilesAttempted = 0;
+bool wifiAttemptActive = false;
+bool setupApActive = false;
+bool wifiWasConnected = false;
+bool otaStarted = false;
+unsigned long wifiAttemptStartedAt = 0;
+unsigned long wifiNextAttemptAt = 0;
+unsigned long wifiApCloseAt = 0;
+String wifiSetupPassword;
 
 const uint16_t COLOR_BACKGROUND = ST77XX_BLACK;
 const uint16_t COLOR_TEXT = ST77XX_WHITE;
@@ -52,6 +80,7 @@ const uint16_t COLOR_MUTED = 0x7BEF;
 const uint16_t COLOR_HEADER = 0x11A6;
 const uint16_t COLOR_PANEL = 0x18E3;
 const uint16_t COLOR_EDGE = 0x2A89;
+const uint16_t COLOR_RED = ST77XX_RED;
 
 enum Page {
     PAGE_CLOCK,
@@ -63,8 +92,10 @@ Page currentPage = PAGE_CLOCK;
 
 const unsigned long RESET_CHORD_HOLD_MS = 1000UL;
 const unsigned long RESET_RESPONSE_DELAY_MS = 500UL;
+const unsigned long BACKLIGHT_CHORD_HOLD_MS = 1000UL;
 bool deviceResetPending = false;
 unsigned long deviceResetRequestedAt = 0;
+bool backlightChordUsed = false;
 
 // Forward declarations
 // Forward declarations
@@ -87,29 +118,29 @@ struct RadioStation {
 };
 
 RadioStation stations[] = {
-    {"Bob FM", "http://sirius.shoutca.st:8011/stream"},
-    {"Classic Hits", "http://www.radiofeeds.net/playlists/audioxi.pls?station=CLASSIC"},
-    {"Darkwave ", "https://radio.webhosting4u.gr/stream/darkwaveradio"},
-    {"Mellow", "https://stream.radioparadise.com/mellow-320"},
     {"Nova 80's", "https://25503.live.streamtheworld.com/NOVA_80S.mp3"},
     {"Nova Rock", "https://25703.live.streamtheworld.com/NOVA_CLASSIC_ROCK.mp3"},
+    {"Radio Nova", "https://25703.live.streamtheworld.com/RADIONOVA.mp3"},
+    {"Classic Hits", "http://www.radiofeeds.net/playlists/audioxi.pls?station=CLASSIC"},
+    {"Bob FM", "http://sirius.shoutca.st:8011/stream"},
+    {"Mellow", "https://stream.radioparadise.com/mellow-320"},
     {"Onic 80's", "http://onic.dublin.live.stream.broadcasting.news/stream-80s?ref=RF"},
     {"Onic Alt", "http://onic.dublin.live.stream.broadcasting.news/stream-alternative-mobile?ref=RF"},
-    {"Radio Nova", "https://25703.live.streamtheworld.com/RADIONOVA.mp3"},
     {"Paradise Rock", "https://stream.radioparadise.com/rock-320"},
+    {"Darkwave ", "https://radio.webhosting4u.gr/stream/darkwaveradio"},
+    {"Undergrnd 80s", "https://ice6.somafm.com/u80s-64-aac"},
     {"Radio X", "http://media-ice.musicradio.com/RadioXLondonMP3"},
     {"Antenne Alt", "https://stream.rockantenne.de/alternative"},
     {"Antenne Rock", "https://stream.rockantenne.de/classic-perlen"},
     {"Soma 70's", "https://ice5.somafm.com/seventies-128-mp3"},
     {"Soma Indie", "https://ice6.somafm.com/indiepop-128-mp3"},
-    {"Underground 80's", "https://ice6.somafm.com/u80s-64-aac"},
     {"Velvet", "http://stream.btsstream.com:8012/velvet.mp3"},
     {"Zenith Rock", "http://91.189.64.188:3644/zenith128mp3"}
 };
 
 const int stationCount = sizeof(stations) / sizeof(stations[0]);
 
-int currentStation = 10; 
+int currentStation = 11; 
 String currentStationName = "Radio X";
 
 // ============================================================
@@ -134,6 +165,14 @@ int alarmMinute = 45;
 bool alarmEnabled = false;
 bool alarmPlaying = false;
 
+void updateAmplifierPower()
+{
+    digitalWrite(
+        AMP_SHDN_PIN,
+        alarmPlaying || volumeLevel > VOLUME_MIN ? HIGH : LOW
+    );
+}
+
 int alarmPrimaryStation = 0;
 int alarmFallbackStation = 1;
 
@@ -156,6 +195,8 @@ String currentStationText = "";
 String currentSongText = "";
 String currentStatusText = "Connecting...";
 bool metadataChanged = false;
+bool stationDisplayChanged = false;
+bool wifiIconChanged = false;
 
 // ============================================================
 // TOUCH
@@ -434,6 +475,7 @@ void connectStation(int index)
     currentSongText = "";
     currentStatusText = "Connecting...";
     metadataChanged = true;
+    stationDisplayChanged = true;
 
     marqueeArtistText = "";
     marqueeSongText = "";
@@ -492,8 +534,6 @@ void audio_info(const char *info)
 
     currentStatusText =
         String(info);
-
-    metadataChanged = true;
 
     if (
         alarmPlaying &&
@@ -663,7 +703,7 @@ bool updateMarquee()
 
         int w =
             marqueeArtistText.length() *
-            6;
+            12;
 
         if (
             artistScrollX <
@@ -714,7 +754,7 @@ bool updateMarquee()
 
         int w =
             marqueeSongText.length() *
-            6;
+            12;
 
         if (
             songScrollX <
@@ -799,6 +839,8 @@ void startAlarm()
         volumeLevel
     );
 
+    updateAmplifierPower();
+
     alarmVolumeBoosted = true;
 
     lastAlarmRampMillis =
@@ -846,6 +888,8 @@ void stopAlarm()
 
         alarmVolumeBoosted = false;
     }
+
+    updateAmplifierPower();
 
     // The alarm stays armed and will fire again
     // tomorrow - only the ringing is stopped.
@@ -900,6 +944,8 @@ void checkAlarm()
             audio.setVolume(
                 volumeLevel
             );
+
+            updateAmplifierPower();
 
             Serial.print(
                 "Alarm volume ramped to: "
@@ -1048,7 +1094,10 @@ void handleAlarmTouch()
             touchStateVolUp
         );
 
-    if (p)
+    if (
+        p &&
+        digitalRead(BUTTON_PIN) != LOW
+    )
     {
         alarmHour =
             (alarmHour + 23) % 24;
@@ -1078,7 +1127,10 @@ void handleAlarmTouch()
         drawAlarmPage(false);
     }
 
-    if (u)
+    if (
+        u &&
+        digitalRead(BUTTON_PIN) != LOW
+    )
     {
         alarmMinute =
             (alarmMinute + 1) % 60;
@@ -1127,7 +1179,10 @@ void handleTouch()
             touchStateVolUp
         );
 
-    if (p)
+    if (
+        p &&
+        digitalRead(BUTTON_PIN) != LOW
+    )
         previousStation();
 
     if (n)
@@ -1155,6 +1210,8 @@ void handleTouch()
             );
         }
 
+        updateAmplifierPower();
+
         if (
             currentPage ==
             PAGE_NOW_PLAYING
@@ -1168,7 +1225,10 @@ void handleTouch()
     // VOLUME UP
     // --------------------------------------------------------
 
-    if (u)
+    if (
+        u &&
+        digitalRead(BUTTON_PIN) != LOW
+    )
     {
         volumeLevel =
             min(
@@ -1182,6 +1242,8 @@ void handleTouch()
                 volumeLevel
             );
         }
+
+        updateAmplifierPower();
 
         if (
             currentPage ==
@@ -1364,7 +1426,7 @@ void drawAlarmPage(bool full)
     );
 
     tft.print(
-        "Touch: -H / +H / -M / +M"
+        "Touch: -H / +H / +M / -M"
     );
 
     tft.setCursor(
@@ -1383,38 +1445,40 @@ void drawAlarmPage(bool full)
 
 void drawClockPage(bool full)
 {
+    static String lastAlarmDisplay = "";
+    static String lastDisplayedStation = "";
+    static String lastDisplayedSsid = "";
+    static String lastDisplayedIp = "";
+    static bool lastDisplayedAlarmEnabled = false;
+    static bool lastDisplayedWifiConnected = false;
+
     if (full)
-        tft.fillScreen(
-            COLOR_BACKGROUND
-        );
+    {
+        tft.fillScreen(COLOR_BACKGROUND);
 
-    tft.fillRect(
-        0,
-        0,
-        320,
-        38,
-        COLOR_HEADER
-    );
+        tft.fillRect(0, 0, 320, 38, COLOR_HEADER);
+        tft.setTextColor(COLOR_TEXT);
+        tft.setTextSize(2);
+        tft.setCursor(60, 10);
+        tft.print("RADIO ALARM CLOCK");
 
-    tft.setTextColor(
-        COLOR_TEXT
-    );
+        tft.setTextSize(1);
+        tft.setCursor(120, 28);
+        tft.print("By stevecrow74");
 
-    tft.setTextSize(2);
+        tft.drawRoundRect(8, 140, 304, 65, 5, COLOR_EDGE);
+        tft.setTextSize(1);
+        tft.setTextColor(COLOR_MUTED);
+        tft.setCursor(18, 148);
+        tft.print("ALARM");
+    }
 
-    tft.setCursor(
-        60,
-        10
-    );
-
-    tft.print(
-        "RADIO ALARM CLOCK"
-    );
-
-    drawWiFiIcon(
-        WiFi.status() ==
-        WL_CONNECTED
-    );
+    bool wifiConnected = WiFi.status() == WL_CONNECTED;
+    if (full || wifiConnected != lastDisplayedWifiConnected)
+    {
+        drawWiFiIcon(wifiConnected);
+        lastDisplayedWifiConnected = wifiConnected;
+    }
 
     String now =
         getTimeString();
@@ -1482,109 +1546,64 @@ void drawClockPage(bool full)
             date;
     }
 
-    tft.drawRoundRect(
-        8,
-        140,
-        304,
-        65,
-        5,
-        COLOR_EDGE
-    );
-
-    tft.setTextSize(1);
-
-    tft.setTextColor(
-        COLOR_MUTED
-    );
-
-    tft.setCursor(
-        18,
-        148
-    );
-
-    tft.print(
-        "ALARM"
-    );
-    
-        tft.fillRect(
-            30,
-            160,
-            200,
-            30,
-            COLOR_BACKGROUND
-        );
     String at =
         alarmTimeString();
 
+    if (full || at != lastAlarmDisplay)
+    {
+        tft.fillRect(30, 160, 200, 30, COLOR_BACKGROUND);
+        tft.setTextSize(3);
+        tft.setTextColor(COLOR_TEXT);
+        tft.setCursor(110, 164);
+        tft.print(at);
+        lastAlarmDisplay = at;
+    }
 
-        
-    tft.setTextSize(3);
+    if (full || alarmEnabled != lastDisplayedAlarmEnabled)
+    {
+        tft.fillRect(250, 160, 40, 40, COLOR_BACKGROUND);
+        tft.drawBitmap(
+            255,
+            165,
+            alarmIconBitmap,
+            32,
+            32,
+            alarmEnabled ? COLOR_ACCENT : COLOR_MUTED
+        );
+        lastDisplayedAlarmEnabled = alarmEnabled;
+    }
 
-    tft.setTextColor(
-        COLOR_TEXT
-    );
+    String displayedSsid = wifiConnected ?
+        WiFi.SSID() :
+        setupApActive ? String(WIFI_SETUP_SSID) : String("Disconnected");
+    String displayedIp = wifiConnected ?
+        WiFi.localIP().toString() :
+        setupApActive ? String("192.168.2.1") : String("--");
 
-    tft.setCursor(
-        110,
-        164
-    );
+    if (full || currentStationName != lastDisplayedStation)
+    {
+        tft.fillRect(8, 207, 304, 16, COLOR_BACKGROUND);
+        tft.setTextSize(1);
+        tft.setTextColor(COLOR_TEXT);
+        tft.setCursor((320 - currentStationName.length() * 6) / 2, 208);
+        tft.print(currentStationName);
+        lastDisplayedStation = currentStationName;
+    }
 
-    tft.print(at);
-
-    tft.drawBitmap(
-        255,
-        165,
-        alarmIconBitmap,
-        32,
-        32,
-        alarmEnabled ?
-        COLOR_ACCENT :
-        COLOR_MUTED
-    );
-
-    tft.fillRect(
-        8,
-        210,
-        304,
-        18,
-        COLOR_BACKGROUND
-    );
-
-    tft.setTextSize(1);
-
-    tft.setTextColor(
-        COLOR_TEXT
-    );
-    tft.setCursor(
-            (320 - currentStationName.length() * 6) / 2,
-            212
-    
-    );
-
-    tft.print(
-        currentStationName
-    );
-
-    tft.fillRect(
-        0,
-        230,
-        320,
-        10,
-        COLOR_BACKGROUND
-    );
-
-    tft.setTextColor(
-        COLOR_MUTED
-    );
-
-    tft.setCursor(
-        20,
-        231
-    );
-
-    tft.print(
-        "short: Radio      hold 3s: Alarm"
-    );
+    if (full || displayedSsid != lastDisplayedSsid || displayedIp != lastDisplayedIp)
+    {
+        tft.fillRect(8, 224, 304, 16, COLOR_BACKGROUND);
+        tft.setTextSize(1);
+        tft.setTextColor(COLOR_TEXT);
+        tft.setCursor(200, 228);
+        tft.print("SSID: ");
+        tft.print(displayedSsid);
+        tft.setCursor(10, 228);
+        tft.print("IP: ");
+        tft.print(displayedIp);
+        lastDisplayedSsid = displayedSsid;
+        lastDisplayedIp = displayedIp;
+    }
 }
 
 // ============================================================
@@ -1652,8 +1671,132 @@ void drawVolumeControl()
     tft.print(volumeLevel);
 }
 
+void drawNowPlayingStation()
+{
+    int prev =
+        (currentStation - 1 +
+         stationCount) %
+        stationCount;
+
+    int next =
+        (currentStation + 1) %
+        stationCount;
+
+    tft.fillRect(
+        0,
+        38,
+        320,
+        45,
+        COLOR_BACKGROUND
+    );
+
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_MUTED);
+    tft.setCursor(8, 55);
+    tft.print(stations[prev].name);
+
+    tft.setTextColor(COLOR_ACCENT);
+    tft.setTextSize(2);
+
+    int cw =
+        strlen(stations[currentStation].name) * 12;
+
+    tft.setCursor(
+        (320 - cw) / 2,
+        50
+    );
+    tft.print(stations[currentStation].name);
+
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_MUTED);
+
+    int nw =
+        strlen(stations[next].name) * 6;
+
+    tft.setCursor(
+        312 - nw,
+        55
+    );
+    tft.print(stations[next].name);
+}
+
+void drawNowPlayingMetadata()
+{
+    tft.fillRect(
+        0,
+        91,
+        320,
+        25,
+        COLOR_BACKGROUND
+    );
+
+    tft.setTextColor(
+        COLOR_TEXT
+    );
+
+    tft.setTextSize(2);
+
+    String artist =
+        marqueeArtistText.length() ?
+        marqueeArtistText :
+        currentStationText;
+
+    int aw =
+        artist.length() * 12;
+
+    int ax =
+        artistScrolling ?
+        artistScrollX :
+        (320 - aw) / 2;
+
+    tft.setCursor(
+        ax,
+        96
+    );
+
+    tft.print(
+        artist
+    );
+
+    tft.fillRect(
+        0,
+        118,
+        320,
+        25,
+        COLOR_BACKGROUND
+    );
+
+    String song =
+        marqueeSongText.length() ?
+        marqueeSongText :
+        currentSongText;
+
+    int sw =
+        song.length() * 12;
+
+    int sx =
+        songScrolling ?
+        songScrollX :
+        (320 - sw) / 2;
+
+    tft.setCursor(
+        sx,
+        123
+    );
+
+    tft.print(
+        song
+    );
+}
+
 void drawNowPlaying(bool full)
 {
+    if (!full)
+    {
+        drawNowPlayingMetadata();
+        return;
+    }
+
     if (full)
         tft.fillScreen(
             COLOR_BACKGROUND
@@ -1691,158 +1834,43 @@ void drawNowPlaying(bool full)
         title
     );
 
+ tft.setTextSize(2);
+
+    tft.setTextColor(
+        COLOR_RED
+    );
+
+    tft.setCursor(
+        5,
+        3
+    );
+
+    tft.print(
+        "DONT"
+    );
+ tft.setTextSize(2);
+
+    tft.setTextColor(
+        COLOR_RED
+    );
+
+    tft.setCursor(
+        5,
+        17
+    );
+
+    tft.print(
+        "PANIC"
+    );
+
     drawWiFiIcon(
         WiFi.status() ==
         WL_CONNECTED
     );
 
-    int prev =
-        (currentStation - 1 +
-         stationCount) %
-        stationCount;
+    drawNowPlayingStation();
 
-    int next =
-        (currentStation + 1) %
-        stationCount;
-
-    tft.fillRect(
-        0,
-        38,
-        320,
-        45,
-        COLOR_BACKGROUND
-    );
-
-    tft.setTextSize(1);
-
-    tft.setTextColor(
-        COLOR_MUTED
-    );
-
-    tft.setCursor(
-        8,
-        55
-    );
-
-    tft.print(
-        stations[prev].name
-    );
-
-    tft.setTextColor(
-        COLOR_ACCENT
-    );
-
-    tft.setTextSize(2);
-
-    int cw =
-        strlen(
-            stations[
-                currentStation
-            ].name
-        ) * 12;
-
-    tft.setCursor(
-        (320 - cw) / 2,
-        50
-    );
-
-    tft.print(
-        stations[
-            currentStation
-        ].name
-    );
-
-    tft.setTextSize(1);
-
-    tft.setTextColor(
-        COLOR_MUTED
-    );
-
-    int nw =
-        strlen(
-            stations[next].name
-        ) * 6;
-
-    tft.setCursor(
-        312 - nw,
-        55
-    );
-
-    tft.print(
-        stations[next].name
-    );
-
-tft.fillRect(
-    0,
-    91,
-    320,
-    25,
-    COLOR_BACKGROUND
-);
-
-tft.setTextColor(
-    COLOR_TEXT
-);
-
-tft.setTextSize(2);
-
-String artist =
-    marqueeArtistText.length() ?
-    marqueeArtistText :
-    currentStationText;
-
-int aw =
-    artist.length() * 12;
-
-int ax =
-    artistScrolling ?
-    artistScrollX :
-    (320 - aw) / 2;
-
-if (ax < 7)
-    ax = 7;
-
-tft.setCursor(
-    ax,
-    96
-);
-
-tft.print(
-    artist
-);
-
-tft.fillRect(
-    0,
-    118,
-    320,
-    25,
-    COLOR_BACKGROUND
-);
-
-String song =
-    marqueeSongText.length() ?
-    marqueeSongText :
-    currentSongText;
-
-int sw =
-    song.length() * 12;
-
-int sx =
-    songScrolling ?
-    songScrollX :
-    (320 - sw) / 2;
-
-if (sx < 7)
-    sx = 7;
-
-tft.setCursor(
-    sx,
-    123
-);
-
-tft.print(
-    song
-);
+    drawNowPlayingMetadata();
 
 tft.fillRect(
     0,
@@ -1852,77 +1880,18 @@ tft.fillRect(
     COLOR_BACKGROUND
 );
 
-tft.setTextSize(1);
-
-
-    tft.fillRect(
-        15,
-        185,
-        290,
-        22,
-        COLOR_BACKGROUND
-    );
-
-    tft.drawRect(
-        15,
-        188,
-        290,
-        14,
-        COLOR_EDGE
-    );
-
-    int bw =
-        map(
-            volumeLevel,
-            VOLUME_MIN,
-            VOLUME_MAX,
-            0,
-            286
-        );
-
-    if (bw > 0)
-    {
-        tft.fillRect(
-            17,
-            190,
-            bw,
-            10,
-            COLOR_ACCENT
-        );
-    }
+drawVolumeControl();
 
     tft.setTextSize(1);
+    tft.setTextColor(COLOR_MUTED);
+    tft.setCursor(8, 232);
+    tft.print("< Station >      ");
 
-    tft.setTextColor(
-        COLOR_TEXT
-    );
+    tft.setTextColor(COLOR_RED);
+    tft.print("Mostly Harmless");
 
-    tft.setCursor(
-        145,
-        218
-    );
-
-    tft.print(
-        "VOLUME "
-    );
-
-    tft.print(
-        volumeLevel
-    );
-
-    tft.setTextColor(
-        COLOR_MUTED
-    );
-
-    tft.setCursor(
-        8,
-        232
-    );
-
-    tft.print(
-
-        "+ Station -                           + Volume -"
-    );
+    tft.setTextColor(COLOR_MUTED);
+    tft.print("    + Volume -");
 }
 
 // ============================================================
@@ -2012,6 +1981,7 @@ void handlePhysicalButton()
             pressedAt;
 
         down = false;
+        backlightChordUsed = false;
 
         if (
             held < 1000 &&
@@ -2086,7 +2056,11 @@ void handlePhysicalButton()
             millis() -
             pressedAt;
 
-        if (held >= 3000)
+        if (
+            held >= 3000 &&
+            !backlightChordUsed &&
+            !touchStateVolUp
+        )
         {
             actionDone = true;
 
@@ -2095,6 +2069,45 @@ void handlePhysicalButton()
 
             drawAlarmPage(true);
         }
+    }
+
+}
+
+void handleBacklightSwitchChord()
+{
+    static bool chordActive = false;
+    static bool actionDone = false;
+    static unsigned long chordStartedAt = 0;
+
+    bool chordHeld =
+        digitalRead(BUTTON_PIN) == LOW &&
+        touchStateVolUp;
+
+    if (!chordHeld)
+    {
+        chordActive = false;
+        actionDone = false;
+        return;
+    }
+
+    if (!chordActive)
+    {
+        chordActive = true;
+        chordStartedAt = millis();
+    }
+
+    if (
+        !actionDone &&
+        millis() - chordStartedAt >=
+            BACKLIGHT_CHORD_HOLD_MS
+    )
+    {
+        actionDone = true;
+        backlightChordUsed = true;
+        digitalWrite(
+            BACKLIGHT_PIN,
+            digitalRead(BACKLIGHT_PIN) == HIGH ? LOW : HIGH
+        );
     }
 }
 
@@ -2284,12 +2297,54 @@ input[type=range]{
  color:#b8c8c3
 }
 
+.wifiProfile{
+ display:flex;
+ align-items:center;
+ gap:8px;
+ padding:8px 0;
+ border-bottom:1px solid #2a89
+}
+
+.wifiProfileName{
+ flex:1;
+ min-width:0;
+ overflow-wrap:anywhere;
+ font-size:14px
+}
+
+.wifiProfileActions{
+ display:flex;
+ gap:6px
+}
+
+.wifiProfileActions button{
+ flex:none;
+ min-height:34px;
+ padding:5px 9px;
+ font-size:12px
+}
+
+.wifiProfileStatus{
+ min-height:18px;
+ margin-top:8px;
+ color:#7bef;
+ font-size:12px
+}
+
+.slogan {
+  margin: 12px 0 0;
+  color: #f66;
+  font-size: 20px;
+}
+
 .footer{
  text-align:center;
  margin-top:16px;
  color:#52645e;
  font-size:11px
 }
+
+.footer a{color:#05b9}
 
 @media(max-width:500px){
  .container{padding:9px}
@@ -2303,13 +2358,12 @@ input[type=range]{
 
 <div class="container">
 
+
 <div class="header">
-<center><h1>RADIO ALARM CLOCK</h1>
-
-<div class="sub" id="network">
-Connecting...
-</div></center>
-
+  <center><h1>RADIO ALARM CLOCK</h1>
+  <div class="sub" id="network">Connecting...</div>
+  <h2 class="slogan">DON'T PANIC</h2>
+  <div class="sub">"Time is an illusion. Lunchtime doubly so."</div></center>   
 </div>
 
 <div class="pageNav" role="group" aria-label="Display page">
@@ -2463,12 +2517,24 @@ Alarm:
 
 </div>
 
+<div class="card">
+
+<h2>SAVED WI-FI NETWORKS</h2>
+
+<div id="wifiProfiles">
+Loading...
+</div>
+
+<div class="wifiProfileStatus" id="wifiProfileStatus"></div>
+
+</div>
+
 </div>
 
 </div>
 
 <div class="footer">
-ESP32-S3 Radio Alarm Clock
+ESP32-S3 Radio Alarm Clock By stevecrow74 <b> <a href="/wifi">Wi-Fi setup</a>
 </div>
 
 <div class="resetControl">
@@ -2722,6 +2788,95 @@ async function loadStations()
     {
         alarmInput.value =
             d.alarmTime;
+    }
+}
+
+async function loadWiFiProfiles()
+{
+    const data =
+        await api('/api/wifi/profiles');
+
+    const list =
+        document.getElementById('wifiProfiles');
+
+    if (!data || !Array.isArray(data.profiles))
+    {
+        list.textContent = 'Unable to load saved networks.';
+        return;
+    }
+
+    list.replaceChildren();
+
+    data.profiles.forEach(
+        (profile, index) =>
+        {
+            const row = document.createElement('div');
+            row.className = 'wifiProfile';
+
+            const name = document.createElement('span');
+            name.className = 'wifiProfileName';
+            name.textContent = profile.ssid +
+                (profile.selected ? ' (preferred)' : '');
+
+            const actions = document.createElement('div');
+            actions.className = 'wifiProfileActions';
+
+            const connect = document.createElement('button');
+            connect.textContent = 'Connect';
+            connect.disabled = profile.selected;
+            connect.onclick = () => selectWiFiProfile(index);
+
+            const remove = document.createElement('button');
+            remove.textContent = 'Remove';
+            remove.onclick = () => removeWiFiProfile(index);
+
+            actions.append(connect, remove);
+            row.append(name, actions);
+            list.append(row);
+        }
+    );
+
+    if (!data.profiles.length)
+        list.textContent = 'No saved networks. Use Wi-Fi setup to add one.';
+}
+
+async function selectWiFiProfile(index)
+{
+    const result =
+        await postApi('/api/wifi/select', {index});
+
+    document.getElementById('wifiProfileStatus')
+        .textContent = result ? 'Connecting to saved network...' : 'Could not select network.';
+
+    await loadWiFiProfiles();
+}
+
+async function removeWiFiProfile(index)
+{
+    const result =
+        await postApi('/api/wifi/delete', {index});
+
+    document.getElementById('wifiProfileStatus')
+        .textContent = result ? 'Saved network removed.' : 'Could not remove network.';
+
+    await loadWiFiProfiles();
+}
+
+async function postApi(url, values)
+{
+    try
+    {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: new URLSearchParams(values)
+        });
+
+        return response.ok ? await response.json() : null;
+    }
+    catch (error)
+    {
+        return null;
     }
 }
 
@@ -3031,6 +3186,7 @@ async function initialiseWebUI()
 
 
     await loadStations();
+    await loadWiFiProfiles();
 }
 
 
@@ -3057,6 +3213,151 @@ setInterval(
 
 </script>
 
+</body>
+</html>
+)rawliteral";
+
+const char WIFI_SETUP_HTML[] PROGMEM = R"rawliteral(
+<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Radio Alarm Clock Wi-Fi</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:18px;background:#07100d;color:#fff;font:16px Arial,sans-serif}
+main{max-width:520px;margin:auto}
+h1{font-size:22px}
+section{border:1px solid #2a89;background:#10231e;padding:16px;margin:12px 0}
+label{display:block;margin:12px 0 5px;color:#7bef;font-size:13px}
+input,select,button{width:100%;min-height:42px;padding:9px;border:1px solid #2a89;border-radius:6px;background:#07100d;color:#fff;font-size:15px}
+button{margin-top:9px;background:#183b;cursor:pointer}
+.profile{display:flex;align-items:center;gap:8px;margin:8px 0}
+.profile span{flex:1;overflow-wrap:anywhere}
+.profile button{width:auto;min-width:75px;margin:0}
+#status{min-height:22px;color:#05b9}
+</style>
+</head>
+<body>
+<main>
+<h1>Wi-Fi setup</h1>
+<p id="status">Choose a network, then save its password.</p>
+<section>
+<label for="networks">Nearby networks</label>
+<select id="networks"><option value="">Scan to find networks</option></select>
+<button type="button" onclick="scanNetworks()">Scan networks</button>
+<label for="ssid">Network name (SSID)</label>
+<input id="ssid" maxlength="32" autocomplete="off">
+<label for="password">Password (leave empty for an open network)</label>
+<input id="password" type="password" maxlength="63" autocomplete="new-password">
+<button type="button" onclick="saveNetwork()">Save and connect</button>
+</section>
+<section>
+<h2>Saved networks</h2>
+<div id="saved"></div>
+</section>
+</main>
+<script>
+const statusText = document.getElementById('status');
+
+async function post(path, values)
+{
+    return fetch(path, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: new URLSearchParams(values)
+    });
+}
+
+async function scanNetworks()
+{
+    statusText.textContent = 'Scanning...';
+    try
+    {
+        const response = await fetch('/api/wifi/scan');
+        const data = await response.json();
+        if (!response.ok || data.error)
+            throw new Error(data.error || 'Scan request failed.');
+        const select = document.getElementById('networks');
+        select.replaceChildren(new Option('Select a network', ''));
+        data.networks.forEach(ssid => select.add(new Option(ssid, ssid)));
+        statusText.textContent = data.networks.length ? 'Select a network or enter its name.' : 'No networks found.';
+    }
+    catch (error)
+    {
+        statusText.textContent = error.message || 'Scan failed. Try again.';
+    }
+}
+
+document.getElementById('networks').addEventListener('change', event => {
+    if (event.target.value)
+        document.getElementById('ssid').value = event.target.value;
+});
+
+async function loadProfiles()
+{
+    const response = await fetch('/api/wifi/profiles');
+    const data = await response.json();
+    const list = document.getElementById('saved');
+    list.replaceChildren();
+
+    data.profiles.forEach((profile, index) => {
+        const row = document.createElement('div');
+        row.className = 'profile';
+        const name = document.createElement('span');
+        name.textContent = profile.ssid + (profile.selected ? ' (preferred)' : '');
+        const use = document.createElement('button');
+        use.textContent = 'Connect';
+        use.onclick = () => selectProfile(index);
+        const remove = document.createElement('button');
+        remove.textContent = 'Remove';
+        remove.onclick = () => removeProfile(index);
+        row.append(name, use, remove);
+        list.append(row);
+    });
+
+    if (!data.profiles.length)
+        list.textContent = 'No networks saved.';
+}
+
+async function saveNetwork()
+{
+    const ssid = document.getElementById('ssid').value;
+    const password = document.getElementById('password').value;
+    statusText.textContent = 'Saving network...';
+
+    try
+    {
+        const response = await post('/api/wifi/save', {ssid, password});
+        const result = await response.json();
+        if (!response.ok)
+            throw new Error(result.error || 'Could not save network.');
+
+        document.getElementById('password').value = '';
+        statusText.textContent = 'Saved. Connecting; setup access point stays available briefly.';
+        await loadProfiles();
+    }
+    catch (error)
+    {
+        statusText.textContent = error.message;
+    }
+}
+
+async function selectProfile(index)
+{
+    await post('/api/wifi/select', {index});
+    statusText.textContent = 'Connecting to saved network...';
+}
+
+async function removeProfile(index)
+{
+    await post('/api/wifi/delete', {index});
+    await loadProfiles();
+    statusText.textContent = 'Saved network removed.';
+}
+
+loadProfiles();
+</script>
 </body>
 </html>
 )rawliteral";
@@ -3112,10 +3413,29 @@ void getRadioArtistSong(
 
 void handleWebRoot()
 {
+    if (setupApActive)
+    {
+        webServer.send_P(
+            200,
+            "text/html",
+            WIFI_SETUP_HTML
+        );
+        return;
+    }
+
     webServer.send_P(
         200,
         "text/html",
         WEBUI_HTML
+    );
+}
+
+void handleWebWiFiSetup()
+{
+    webServer.send_P(
+        200,
+        "text/html",
+        WIFI_SETUP_HTML
     );
 }
 
@@ -3495,6 +3815,8 @@ void handleWebVolume()
         );
     }
 
+    updateAmplifierPower();
+
     // Update the TFT immediately without
     // redrawing the whole screen.
     if (
@@ -3679,55 +4001,468 @@ void handleWebAlarmStations()
 // WIFI
 // ============================================================
 
+void saveWiFiProfiles()
+{
+    wifiPrefs.putInt("count", wifiProfileCount);
+    wifiPrefs.putInt("selected", preferredWiFiProfile);
+
+    for (int i = 0; i < wifiProfileCount; i++)
+    {
+        wifiPrefs.putString(
+            ("ssid" + String(i)).c_str(),
+            wifiProfiles[i].ssid
+        );
+        wifiPrefs.putString(
+            ("pass" + String(i)).c_str(),
+            wifiProfiles[i].password
+        );
+    }
+}
+
+void loadWiFiProfiles()
+{
+    wifiPrefs.begin("wifi", false);
+
+    wifiProfileCount = constrain(
+        wifiPrefs.getInt("count", 0),
+        0,
+        MAX_WIFI_PROFILES
+    );
+
+    for (int i = 0; i < wifiProfileCount; i++)
+    {
+        wifiProfiles[i].ssid = wifiPrefs.getString(
+            ("ssid" + String(i)).c_str(),
+            ""
+        );
+        wifiProfiles[i].password = wifiPrefs.getString(
+            ("pass" + String(i)).c_str(),
+            ""
+        );
+
+        if (!wifiProfiles[i].ssid.length())
+            wifiProfileCount = i;
+    }
+
+    preferredWiFiProfile = wifiPrefs.getInt("selected", 0);
+    if (preferredWiFiProfile < 0 || preferredWiFiProfile >= wifiProfileCount)
+        preferredWiFiProfile = 0;
+
+    wifiSetupPassword = wifiPrefs.getString("apPass", "");
+    if (wifiSetupPassword.length() < 8)
+    {
+        char password[9];
+        snprintf(
+            password,
+            sizeof(password),
+            "%08lX",
+            static_cast<unsigned long>(esp_random())
+        );
+        wifiSetupPassword = password;
+        wifiPrefs.putString("apPass", wifiSetupPassword);
+    }
+}
+
+int findWiFiProfile(const String &ssid)
+{
+    for (int i = 0; i < wifiProfileCount; i++)
+    {
+        if (wifiProfiles[i].ssid == ssid)
+            return i;
+    }
+
+    return -1;
+}
+
+int saveWiFiProfile(const String &ssid, const String &password)
+{
+    int index = findWiFiProfile(ssid);
+
+    if (index < 0)
+    {
+        if (wifiProfileCount >= MAX_WIFI_PROFILES)
+            return -1;
+
+        index = wifiProfileCount++;
+        wifiProfiles[index].ssid = ssid;
+    }
+
+    wifiProfiles[index].password = password;
+    saveWiFiProfiles();
+    return index;
+}
+
+void drawWiFiSetupScreen()
+{
+    tft.fillScreen(COLOR_BACKGROUND);
+
+    tft.fillRect(0, 0, 320, 36, COLOR_HEADER);
+    tft.setTextColor(COLOR_TEXT);
+    tft.setTextSize(2);
+    tft.setCursor(12, 9);
+    tft.print("WIFI SETUP");
+
+    tft.drawRoundRect(8, 44, 304, 124, 5, COLOR_EDGE);
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_MUTED);
+    tft.setCursor(16, 52);
+    tft.print("CONNECT YOUR PHONE TO");
+
+    tft.setTextSize(2);
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(58, 66);
+    tft.print(WIFI_SETUP_SSID);
+
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_MUTED);
+    tft.setCursor(16, 99);
+    tft.print("SETUP PASSWORD");
+
+    tft.setTextSize(2);
+    tft.setTextColor(COLOR_ACCENT);
+    tft.setCursor(112, 114);
+    tft.print(wifiSetupPassword);
+
+    tft.setTextColor(COLOR_MUTED);
+    tft.setTextSize(1);
+    tft.setCursor(16, 183);
+    tft.print("THEN OPEN THIS ADDRESS");
+
+    tft.setTextColor(COLOR_TEXT);
+    tft.setTextSize(2);
+    tft.setCursor(76, 198);
+    tft.print("192.168.2.1");
+}
+
+void startWiFiSetupAP()
+{
+    if (setupApActive)
+        return;
+
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAPConfig(
+        IPAddress(192, 168, 2, 1),
+        IPAddress(192, 168, 2, 1),
+        IPAddress(255, 255, 255, 0)
+    );
+
+    if (!WiFi.softAP(WIFI_SETUP_SSID, wifiSetupPassword.c_str()))
+    {
+        Serial.println("Failed to start Wi-Fi setup AP");
+        return;
+    }
+
+    setupApActive = true;
+    wifiApCloseAt = 0;
+    Serial.println("Wi-Fi setup AP started");
+    Serial.print("SSID: ");
+    Serial.println(WIFI_SETUP_SSID);
+    Serial.print("Password: ");
+    Serial.println(wifiSetupPassword);
+    Serial.println("Setup page: http://192.168.2.1");
+    drawWiFiSetupScreen();
+}
+
+void startWiFiAttempt(int index)
+{
+    if (wifiProfileCount <= 0)
+    {
+        startWiFiSetupAP();
+        return;
+    }
+
+    if (index < 0 || index >= wifiProfileCount)
+        index = 0;
+
+    if (WiFi.status() == WL_CONNECTED && !setupApActive)
+        startWiFiSetupAP();
+
+    wifiAttemptProfile = index;
+    wifiAttemptStartedAt = millis();
+    wifiAttemptActive = true;
+    wifiWasConnected = false;
+    WiFi.mode(setupApActive ? WIFI_AP_STA : WIFI_STA);
+    WiFi.disconnect(false, false);
+    WiFi.begin(
+        wifiProfiles[index].ssid.c_str(),
+        wifiProfiles[index].password.c_str()
+    );
+
+    Serial.print("Connecting to saved Wi-Fi: ");
+    Serial.println(wifiProfiles[index].ssid);
+}
+
 void connectWiFi()
 {
-    WiFi.mode(
-        WIFI_STA
-    );
-
-    WiFi.begin(
-        WIFI_SSID,
-        WIFI_PASSWORD
-    );
-
-    Serial.print(
-        "Connecting WiFi"
-    );
-
-    unsigned long start =
-        millis();
-
-    while (
-        WiFi.status() !=
-            WL_CONNECTED &&
-        millis() - start <
-            20000
-    )
+    if (!wifiProfileCount)
     {
-        delay(500);
-        Serial.print(".");
+        startWiFiSetupAP();
+        return;
     }
 
-    Serial.println();
+    wifiAttemptProfile = preferredWiFiProfile;
+    wifiProfilesAttempted = 0;
+    startWiFiAttempt(wifiAttemptProfile);
+}
 
-    if (
-        WiFi.status() ==
-        WL_CONNECTED
-    )
+void handleWiFiRecovery()
+{
+    unsigned long now = millis();
+
+    if (WiFi.status() == WL_CONNECTED)
     {
-        Serial.print(
-            "WiFi connected: "
-        );
+        if (!wifiWasConnected)
+        {
+            wifiWasConnected = true;
+            wifiAttemptActive = false;
+            wifiProfilesAttempted = 0;
+            preferredWiFiProfile = wifiAttemptProfile;
+            wifiPrefs.putInt("selected", preferredWiFiProfile);
 
-        Serial.println(
-            WiFi.localIP()
-        );
+            Serial.print("Wi-Fi connected: ");
+            Serial.println(WiFi.localIP());
+            configTzTime(TZ_INFO, NTP_SERVER);
+            connectStation(currentStation);
+
+            if (!otaStarted)
+            {
+                ArduinoOTA.setHostname("radio-alarm-clock");
+                ArduinoOTA.begin();
+                otaStarted = true;
+                Serial.println("OTA ready at radio-alarm-clock.local");
+            }
+
+            currentStatusText = "Wi-Fi connected";
+            wifiIconChanged = true;
+
+            if (setupApActive)
+                wifiApCloseAt = now + WIFI_AP_CLOSE_DELAY_MS;
+        }
+
+        if (setupApActive && wifiApCloseAt && now >= wifiApCloseAt)
+        {
+            WiFi.softAPdisconnect(true);
+            setupApActive = false;
+            wifiApCloseAt = 0;
+            WiFi.mode(WIFI_STA);
+            drawCurrentPage(true);
+        }
+
+        return;
     }
-    else
+
+    if (wifiWasConnected)
     {
-        Serial.println(
-            "WiFi connection failed"
+        wifiWasConnected = false;
+        wifiAttemptActive = false;
+        wifiProfilesAttempted = 0;
+        wifiAttemptProfile = preferredWiFiProfile;
+        wifiNextAttemptAt = now;
+        currentStatusText = "Wi-Fi disconnected; reconnecting";
+        wifiIconChanged = true;
+        Serial.println("Wi-Fi disconnected; starting recovery");
+    }
+
+    if (wifiAttemptActive)
+    {
+        if (now - wifiAttemptStartedAt < WIFI_CONNECT_TIMEOUT_MS)
+            return;
+
+        wifiAttemptActive = false;
+        WiFi.disconnect(false, false);
+        wifiProfilesAttempted++;
+        wifiAttemptProfile = (wifiAttemptProfile + 1) % wifiProfileCount;
+
+        if (wifiProfilesAttempted >= wifiProfileCount)
+        {
+            wifiProfilesAttempted = 0;
+            startWiFiSetupAP();
+            wifiNextAttemptAt = now + WIFI_AP_RETRY_INTERVAL_MS;
+        }
+        else
+        {
+            wifiNextAttemptAt = now + 1000UL;
+        }
+
+        return;
+    }
+
+    if (!wifiProfileCount)
+    {
+        startWiFiSetupAP();
+        return;
+    }
+
+    if (now >= wifiNextAttemptAt)
+    {
+        if (setupApActive)
+            wifiNextAttemptAt = now + WIFI_AP_RETRY_INTERVAL_MS;
+
+        startWiFiAttempt(wifiAttemptProfile);
+    }
+}
+
+void handleWebWiFiScan()
+{
+    int count = WiFi.scanNetworks();
+
+    if (count < 0)
+    {
+        WiFi.scanDelete();
+        webServer.send(
+            503,
+            "application/json",
+            "{\"networks\":[],\"error\":\"Wi-Fi scan failed\"}"
         );
+        return;
+    }
+
+    String json = "{\"networks\":[";
+
+    for (int i = 0; i < count; i++)
+    {
+        String ssid = WiFi.SSID(i);
+        if (!ssid.length())
+            continue;
+
+        if (json[json.length() - 1] != '[')
+            json += ",";
+
+        json += "\"";
+        json += jsonEscape(ssid);
+        json += "\"";
+    }
+
+    json += "]}";
+    WiFi.scanDelete();
+    webServer.send(200, "application/json", json);
+}
+
+void handleWebWiFiProfiles()
+{
+    String json = "{\"profiles\":[";
+
+    for (int i = 0; i < wifiProfileCount; i++)
+    {
+        if (i > 0)
+            json += ",";
+
+        json += "{\"ssid\":\"";
+        json += jsonEscape(wifiProfiles[i].ssid);
+        json += "\",\"selected\":";
+        json += i == preferredWiFiProfile ? "true" : "false";
+        json += "}";
+    }
+
+    json += "]}";
+    webServer.send(200, "application/json", json);
+}
+
+void handleWebWiFiSave()
+{
+    if (!webServer.hasArg("ssid") || !webServer.hasArg("password"))
+    {
+        webServer.send(400, "application/json", "{\"ok\":false}");
+        return;
+    }
+
+    String ssid = webServer.arg("ssid");
+    String password = webServer.arg("password");
+
+    if (!ssid.length() || ssid.length() > 32 || password.length() > 63 ||
+        (password.length() > 0 && password.length() < 8))
+    {
+        webServer.send(400, "application/json", "{\"ok\":false}");
+        return;
+    }
+
+    int index = saveWiFiProfile(ssid, password);
+    if (index < 0)
+    {
+        webServer.send(409, "application/json", "{\"ok\":false,\"error\":\"profile limit reached\"}");
+        return;
+    }
+
+    preferredWiFiProfile = index;
+    wifiPrefs.putInt("selected", index);
+    wifiProfilesAttempted = 0;
+    wifiNextAttemptAt = 0;
+    webServer.send(200, "application/json", "{\"ok\":true}");
+    startWiFiAttempt(index);
+}
+
+void handleWebWiFiSelect()
+{
+    if (!webServer.hasArg("index"))
+    {
+        webServer.send(400, "application/json", "{\"ok\":false}");
+        return;
+    }
+
+    int index = webServer.arg("index").toInt();
+    if (index < 0 || index >= wifiProfileCount)
+    {
+        webServer.send(400, "application/json", "{\"ok\":false}");
+        return;
+    }
+
+    preferredWiFiProfile = index;
+    wifiPrefs.putInt("selected", index);
+    wifiProfilesAttempted = 0;
+    wifiNextAttemptAt = 0;
+    webServer.send(200, "application/json", "{\"ok\":true}");
+    startWiFiAttempt(index);
+}
+
+void handleWebWiFiDelete()
+{
+    if (!webServer.hasArg("index"))
+    {
+        webServer.send(400, "application/json", "{\"ok\":false}");
+        return;
+    }
+
+    int index = webServer.arg("index").toInt();
+    if (index < 0 || index >= wifiProfileCount)
+    {
+        webServer.send(400, "application/json", "{\"ok\":false}");
+        return;
+    }
+
+    bool deletingConnectedProfile =
+        WiFi.status() == WL_CONNECTED &&
+        WiFi.SSID() == wifiProfiles[index].ssid;
+
+    for (int i = index; i < wifiProfileCount - 1; i++)
+        wifiProfiles[i] = wifiProfiles[i + 1];
+
+    wifiProfileCount--;
+    wifiPrefs.remove(("ssid" + String(wifiProfileCount)).c_str());
+    wifiPrefs.remove(("pass" + String(wifiProfileCount)).c_str());
+
+    if (index < preferredWiFiProfile)
+        preferredWiFiProfile--;
+    else if (preferredWiFiProfile >= wifiProfileCount)
+        preferredWiFiProfile = max(0, wifiProfileCount - 1);
+
+    saveWiFiProfiles();
+    webServer.send(200, "application/json", "{\"ok\":true}");
+
+    if (deletingConnectedProfile || wifiProfileCount == 0)
+    {
+        if (deletingConnectedProfile && wifiProfileCount)
+            startWiFiSetupAP();
+
+        WiFi.disconnect(false, false);
+        wifiWasConnected = false;
+        wifiAttemptActive = false;
+        wifiProfilesAttempted = 0;
+        wifiAttemptProfile = preferredWiFiProfile;
+
+        if (wifiProfileCount)
+            startWiFiAttempt(wifiAttemptProfile);
+        else
+            startWiFiSetupAP();
     }
 }
 
@@ -3741,6 +4476,16 @@ void setup()
         115200
     );
 
+    pinMode(
+        AMP_SHDN_PIN,
+        OUTPUT
+    );
+
+    digitalWrite(
+        AMP_SHDN_PIN,
+        LOW
+    );
+
     delay(500);
 
     Serial.println();
@@ -3751,6 +4496,16 @@ void setup()
     pinMode(
         BUTTON_PIN,
         INPUT_PULLUP
+    );
+
+    pinMode(
+        BACKLIGHT_PIN,
+        OUTPUT
+    );
+
+    digitalWrite(
+        BACKLIGHT_PIN,
+        HIGH
     );
 
     tft.init(
@@ -3771,13 +4526,9 @@ void setup()
     calibrateTouch();
 
     loadAlarmSettings();
+    loadWiFiProfiles();
 
     connectWiFi();
-
-    configTzTime(
-        TZ_INFO,
-        NTP_SERVER
-    );
 
     audio.setPinout(
         I2S_BCLK,
@@ -3789,9 +4540,7 @@ void setup()
         volumeLevel
     );
 
-    connectStation(
-        currentStation
-    );
+    updateAmplifierPower();
 
     // ========================================================
     // WEB SERVER ROUTES
@@ -3801,6 +4550,42 @@ void setup()
         "/",
         HTTP_GET,
         handleWebRoot
+    );
+
+    webServer.on(
+        "/wifi",
+        HTTP_GET,
+        handleWebWiFiSetup
+    );
+
+    webServer.on(
+        "/api/wifi/scan",
+        HTTP_GET,
+        handleWebWiFiScan
+    );
+
+    webServer.on(
+        "/api/wifi/profiles",
+        HTTP_GET,
+        handleWebWiFiProfiles
+    );
+
+    webServer.on(
+        "/api/wifi/save",
+        HTTP_POST,
+        handleWebWiFiSave
+    );
+
+    webServer.on(
+        "/api/wifi/select",
+        HTTP_POST,
+        handleWebWiFiSelect
+    );
+
+    webServer.on(
+        "/api/wifi/delete",
+        HTTP_POST,
+        handleWebWiFiDelete
     );
 
     webServer.on(
@@ -3886,15 +4671,16 @@ void setup()
         "Web server started"
     );
 
-    Serial.print(
-        "Open: http://"
-    );
-
-    Serial.println(
-        WiFi.localIP()
-    );
-
-    drawClockPage(true);
+    if (setupApActive)
+    {
+        Serial.println("Wi-Fi setup portal: http://192.168.2.1");
+    }
+    else
+    {
+        Serial.print("Open: http://");
+        Serial.println(WiFi.localIP());
+        drawClockPage(true);
+    }
 
     Serial.println(
         "Setup complete"
@@ -3907,6 +4693,11 @@ void setup()
 
 void loop()
 {
+    handleWiFiRecovery();
+
+    if (otaStarted && WiFi.status() == WL_CONNECTED)
+        ArduinoOTA.handle();
+
     audio.loop();
 
     webServer.handleClient();
@@ -3915,6 +4706,8 @@ void loop()
 
     handleTouch();
 
+    handleBacklightSwitchChord();
+  
     processDeviceReset();
 
     checkAlarm();
@@ -3927,12 +4720,24 @@ void loop()
         bool marqueeMoved =
             updateMarquee();
 
+        if (stationDisplayChanged)
+        {
+            stationDisplayChanged = false;
+            drawNowPlayingStation();
+        }
+
+        if (wifiIconChanged)
+        {
+            wifiIconChanged = false;
+            drawWiFiIcon(WiFi.status() == WL_CONNECTED);
+        }
+
         if (metadataChanged)
         {
             metadataChanged =
                 false;
 
-            drawNowPlaying(true);
+            drawNowPlayingMetadata();
         }
         else if (marqueeMoved)
         {
