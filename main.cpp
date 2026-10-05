@@ -151,8 +151,9 @@ int volumeLevel = 0;
 const int VOLUME_MIN = 0;
 const int VOLUME_MAX = 7;
 const int ALARM_VOLUME = 1;
+const int ALARM_RESTORE_VOLUME = 2;
 
-int alarmRestoreVolume = 2;
+int alarmPreAlarmVolume = 2;
 bool alarmVolumeBoosted = false;
 
 // Alarm ramps one step every ALARM_RAMP_INTERVAL ms
@@ -175,6 +176,7 @@ void updateAmplifierPower()
 
 int alarmPrimaryStation = 0;
 int alarmFallbackStation = 1;
+int alarmPreAlarmStation = -1;
 
 const unsigned long ALARM_MAX_DURATION = 30UL * 60UL * 1000UL;
 unsigned long alarmStartMillis = 0;
@@ -808,13 +810,19 @@ void startAlarm()
 
     alarmPlaying = true;
 
+    if (digitalRead(BACKLIGHT_PIN) == LOW)
+        digitalWrite(BACKLIGHT_PIN, HIGH);
+
     alarmStartMillis =
         millis();
 
     alarmFallbackUsed = false;
 
-    alarmRestoreVolume =
+    alarmPreAlarmVolume =
         volumeLevel;
+
+    alarmPreAlarmStation =
+        currentStation;
 
     // Start at the ALARM_VOLUME step (or the
     // current level if already above it) and
@@ -823,7 +831,7 @@ void startAlarm()
         max(
             ALARM_VOLUME,
             min(
-                alarmRestoreVolume,
+                alarmPreAlarmVolume,
                 VOLUME_MAX
             )
         );
@@ -880,7 +888,7 @@ void stopAlarm()
     if (alarmVolumeBoosted)
     {
         volumeLevel =
-            alarmRestoreVolume;
+            ALARM_RESTORE_VOLUME;
 
         audio.setVolume(
             volumeLevel
@@ -899,6 +907,16 @@ void stopAlarm()
         "Alarm stopped";
 
     metadataChanged = true;
+
+    if (
+        alarmPreAlarmStation >= 0 &&
+        alarmPreAlarmStation < stationCount
+    )
+    {
+        connectStation(
+            alarmPreAlarmStation
+        );
+    }
 
     Serial.println(
         "ALARM STOPPED"
@@ -2517,6 +2535,12 @@ Alarm:
 
 </div>
 
+<div class="controls">
+<button type="button" id="backlightButton" onclick="toggleBacklight()">
+TOGGLE BACKLIGHT
+</button>
+</div>
+
 <div class="card">
 
 <h2>SAVED WI-FI NETWORKS</h2>
@@ -2585,6 +2609,8 @@ async function updateStatus()
 
     if (!d)
         return;
+
+    await refreshBacklightButton();
 
     document.querySelectorAll('.pageButton')
         .forEach(
@@ -2919,6 +2945,31 @@ async function confirmDeviceReset()
 
     if (result && result.ok)
         window.alert('Restarting device...');
+}
+
+async function toggleBacklight()
+{
+    const result =
+        await api('/api/backlight/toggle');
+
+    if (result && result.ok)
+        setBacklightButton(result.backlight);
+}
+
+function setBacklightButton(isOn)
+{
+    document.getElementById('backlightButton')
+        .textContent =
+        isOn ? 'TURN BACKLIGHT OFF' : 'TURN BACKLIGHT ON';
+}
+
+async function refreshBacklightButton()
+{
+    const result =
+        await api('/api/backlight/state');
+
+    if (result && typeof result.backlight === 'boolean')
+        setBacklightButton(result.backlight);
 }
 
 async function selectStation(i)
@@ -3595,6 +3646,39 @@ void handleWebReset()
     );
 
     requestDeviceReset();
+}
+
+void handleWebBacklightToggle()
+{
+    bool backlightOn =
+        digitalRead(BACKLIGHT_PIN) == HIGH;
+
+    digitalWrite(
+        BACKLIGHT_PIN,
+        backlightOn ? LOW : HIGH
+    );
+
+    webServer.send(
+        200,
+        "application/json",
+        backlightOn ?
+            "{\"ok\":true,\"backlight\":false}" :
+            "{\"ok\":true,\"backlight\":true}"
+    );
+}
+
+void handleWebBacklightState()
+{
+    bool backlightOn =
+        digitalRead(BACKLIGHT_PIN) == HIGH;
+
+    webServer.send(
+        200,
+        "application/json",
+        backlightOn ?
+            "{\"backlight\":true}" :
+            "{\"backlight\":false}"
+    );
 }
 
 // ============================================================
@@ -4604,6 +4688,18 @@ void setup()
         "/api/reset",
         HTTP_GET,
         handleWebReset
+    );
+
+    webServer.on(
+        "/api/backlight/toggle",
+        HTTP_GET,
+        handleWebBacklightToggle
+    );
+
+    webServer.on(
+        "/api/backlight/state",
+        HTTP_GET,
+        handleWebBacklightState
     );
 
     webServer.on(
