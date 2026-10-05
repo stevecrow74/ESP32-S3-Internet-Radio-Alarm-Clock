@@ -174,7 +174,8 @@ The web server uses plain HTTP and has no authentication. Keep it on a trusted l
 
 **GY-PCM5102 I2S stereo board:** cut the trace to leg 12 on the PAM8403 chip, this is Shutdown SHDN, connect this pin to GPIO 14.
 This mod, cuts all noise from the amp when volume is set to 0.
-**GMT020-02 7p v1.3 LCD:** Lift the resistor R6 from the pad on the side labeled R6, using a transistor S9013, connect the Emitter to the bare pad, conect the Collector to the resistor, connect the Base to a 1 kOhm resistor and that to GPIO 7. this will control the backlight leds and turn them on/off with  hold button + volume up for one second.
+
+**GMT020-02 7p v1.3 LCD:** Lift the resistor R6 from the pad on the side labeled R6, using a transistor S9013, connect the Emitter to the bare pad, conect the Collector to the resistor, connect the Base to a 1k Ohm resistor and that to GPIO 7. this will control the backlight leds and turn them on/off with  hold button + volume up for one second.
 
 
 ## Project Files
