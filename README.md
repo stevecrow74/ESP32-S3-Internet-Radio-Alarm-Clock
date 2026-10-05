@@ -182,3 +182,6 @@ This mod, cuts all noise from the amp when volume is set to 0.
 - `platformio.ini` - PlatformIO board, framework, upload/monitor speeds, and library dependencies.
 - `src/main.cpp` - Firmware, pin assignments, network/time-zone settings, web UI, and device behavior.
 
+## OTA
+Updates can now be performed over wifi connection, make sure you are on the same network to enable this.
+
