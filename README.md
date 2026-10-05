@@ -7,7 +7,7 @@ the top section is three buttons that change between pages Clock, Radio, Alarm.
 below that is what's currently playing on the radio, Station name with metadata 
 showing song title and artist (if available).
 two buttons to select previous/next radio station.
-A volume slider to increase/dcrease volume with text readout below that.
+A volume slider to increase/decrease volume with text readout below that.
 
 https://github.com/stevecrow74/ESP32-S3-Internet-Radio-Alarm-Clock/blob/main/img_3637.png
 
@@ -59,6 +59,10 @@ it is possible for what ever reason to reset the device using a button combinati
 push physical button and Volume down pad together for 1 second, this will force a reset.
 alarm time and current station shouldn't be affected by this.
 
+# Backlight led
+It is possible to turn on and off the backlight led to the screen (with hardware mod, see below).
+Push and hold physical button and Volume up pad for one second to switch on/off.
+
 
 
 
@@ -81,7 +85,7 @@ Internet radio and alarm clock firmware for an ESP32-S3, an ST7789 color TFT, ca
 | Device | Connection / details |
 | --- | --- |
 | ESP32-S3-N16R8 | 16 MB flash, 8 MB PSRAM; current PlatformIO target is `esp32-s3-devkitc-1` |
-| GMT020-02 LCD | 2-inch ST7789 color LCD, SPI; wiring below |
+| GMT020-02 7p v1.3 LCD | 2-inch ST7789 color LCD, SPI; wiring below |
 | Capacitive touch electrodes or compatible touch inputs | ESP32-S3 GPIOs 2, 6, 4, and 5 |
 | Momentary push button | GPIO 1 to GND; configured with internal pull-up |
 | GY-PCM5102 I2S stereo board | I2S DAC; connect its analog output to an amplifier or powered speakers |
@@ -165,6 +169,13 @@ The web server uses plain HTTP and has no authentication. Keep it on a trusted l
 - **No radio audio:** Confirm internet access and station availability; check the I2S BCLK, LRC, and DOUT connections and the external DAC/amplifier wiring.
 - **No display:** Verify TFT power, backlight, SPI wiring, and the CS/DC/reset connections against the pin map.
 - **Alarm station fails:** The alarm attempts its configured fallback station if playback reports an error.
+
+## Hardware Modifications
+
+**GY-PCM5102 I2S stereo board:** cut the trace to leg 12 on the PAM8403 chip, this is Shutdown SHDN, connect this pin to GPIO 14.
+This mod, cuts all noise from the amp when volume is set to 0.
+**GMT020-02 7p v1.3 LCD:** Lift the resistor R6 from the pad on the side labeled R6, using a transistor S9013, connect the Emitter to the bare pad, conect the Collector to the resistor, connect the Base to a 1 kOhm resistor and that to GPIO 7. this will control the backlight leds and turn them on/off with  hold button + volume up for one second.
+
 
 ## Project Files
 
